@@ -1,0 +1,23 @@
+# permissions for end users to view conductors.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: idea3project
+    app.kubernetes.io/managed-by: kustomize
+  name: conductor-viewer-role
+rules:
+- apiGroups:
+  - apps.haojiang.cn
+  resources:
+  - conductors
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apps.haojiang.cn
+  resources:
+  - conductors/status
+  verbs:
+  - get

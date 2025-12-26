@@ -91,20 +91,33 @@ func (r *ConductorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if gpuReq >= 0 {
 			totalReq := gpuReq * float64(pg.Spec.MinMember)
 
-			// [新增日志] 输出每个 PodGroup 的需求详情
+			// -------------------------------------------------------
+			// [修改点] 计算 Reward = 总需求 * 优先级
+			// -------------------------------------------------------
+			prioFactor := float64(pg.Spec.Priority)
+			// 如果没设置优先级(0)或为负，默认为 1.0，防止乘积为0导致任务被忽略
+			if prioFactor <= 0 {
+				prioFactor = 1.0
+			}
+
+			finalReward := totalReq * prioFactor
+
+			// [日志] 输出详细的计算参数
 			logger.Info("检测到 PodGroup 需求",
 				"Name", pg.Name,
 				"SinglePodGPU", gpuReq,
 				"MemberNum", pg.Spec.MinMember,
-				"TotalGPURequired", totalReq,
+				"TotalGPU", totalReq,
+				"UserPriority", prioFactor,
+				"FinalCalculatedReward", finalReward,
 			)
 
 			candidates = append(candidates, CandidatePG{
 				Name:      pg.Name,
 				MemberNum: int(pg.Spec.MinMember),
 				PodWeight: gpuReq,
-				// 价值 P = 总 GPU 需求 (可根据需求修改)
-				Priority: totalReq,
+				// 将计算后的最终 Reward 赋值给 Priority 供 GLPK 使用
+				Priority: finalReward,
 			})
 		}
 	}
@@ -142,7 +155,7 @@ func (r *ConductorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			D = append(D, val)
 		}
 	} else {
-		// 如果集群完全没有空闲资源 (c_max=0)，为了防止算法出错，给一个默认值
+		// 如果集群完全没有空闲资源 (c_max=0)，给一个默认值
 		D = []float64{1.0}
 	}
 
@@ -218,7 +231,6 @@ func (r *ConductorReconciler) getClusterCapacities(ctx context.Context) ([]float
 
 		// 只要节点有 GPU 能力 (allocatable > 0)，就记录下来，哪怕 free 是 0
 		if allocatable > 0 {
-			// [新增日志] 输出每个节点的资源详情
 			logger.Info("节点 GPU 状态",
 				"NodeName", node.Name,
 				"Total(Allocatable)", allocatable,

@@ -36,7 +36,9 @@ import (
 
 	appsv1 "github.com/certainly-cyber/Conductoroperator/api/v1"
 	"github.com/certainly-cyber/Conductoroperator/internal/controller"
+
 	//+kubebuilder:scaffold:imports
+	"github.com/certainly-cyber/Conductoroperator/api/external"
 )
 
 var (
@@ -52,6 +54,14 @@ func init() {
 }
 
 func main() {
+	// 初始化 Scheme
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(appsv1.AddToScheme(scheme))
+
+	// 2. 【新增】注册外部 PodGroup 资源到 Scheme
+	// 这样 client 才能理解 PodGroup 结构体
+	utilruntime.Must(external.AddToScheme(scheme))
 	var metricsAddr string
 	var enableLeaderElection bool
 	var probeAddr string

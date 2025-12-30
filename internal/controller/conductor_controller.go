@@ -4,11 +4,6 @@ package controller
 #cgo LDFLAGS: -lglpk
 #include <glpk.h>
 #include <stdlib.h>
-
-// 辅助函数：封装 GLPK 矩阵加载
-void set_matrix(glp_prob *lp, int size, int *ia, int *ja, double *ar) {
-    glp_load_matrix(lp, size, ia, ja, ar);
-}
 */
 import "C"
 import (
@@ -39,13 +34,16 @@ type CandidatePG struct {
 	PodWeight float64 // 单个成员的重量 (GPU Request)
 }
 
-// fd 计算约束函数 (移植自你的代码)
+// fd 计算约束函数 (带有精度修正)
+// 修正逻辑：当 x/d 极其接近整数时，视为整除，执行 (x/d) - 1
 func fd(x float64, d float64) float64 {
-	mod := math.Mod(x, d)
-	if mod == 0 {
-		return (x / d) - 1
+	val := x / d
+	nearest := math.Round(val)
+	// [精度修正] 1e-9 容忍度，处理浮点数除法的微小误差
+	if math.Abs(val-nearest) < 1e-9 {
+		return nearest - 1
 	}
-	return math.Floor(x / d)
+	return math.Floor(val)
 }
 
 // ConductorReconciler reconciles a Conductor object
@@ -91,18 +89,14 @@ func (r *ConductorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if gpuReq >= 0 {
 			totalReq := gpuReq * float64(pg.Spec.MinMember)
 
-			// -------------------------------------------------------
-			// [修改点] 计算 Reward = 总需求 * 优先级
-			// -------------------------------------------------------
+			// 计算 Reward = 总需求 * 优先级
 			prioFactor := float64(pg.Spec.Priority)
-			// 如果没设置优先级(0)或为负，默认为 1.0，防止乘积为0导致任务被忽略
 			if prioFactor <= 0 {
 				prioFactor = 1.0
 			}
 
 			finalReward := totalReq * prioFactor
 
-			// [日志] 输出详细的计算参数
 			logger.Info("检测到 PodGroup 需求",
 				"Name", pg.Name,
 				"SinglePodGPU", gpuReq,
@@ -116,8 +110,7 @@ func (r *ConductorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 				Name:      pg.Name,
 				MemberNum: int(pg.Spec.MinMember),
 				PodWeight: gpuReq,
-				// 将计算后的最终 Reward 赋值给 Priority 供 GLPK 使用
-				Priority: finalReward,
+				Priority:  finalReward,
 			})
 		}
 	}
@@ -128,17 +121,20 @@ func (r *ConductorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// 3. 准备数据: Nodes (作为 c 数组)
+	// [重要] 这里现在会过滤掉 free=0 的节点，防止 fd(0) = -1 的惩罚
 	c, err := r.getClusterCapacities(ctx)
 	if err != nil {
 		logger.Error(err, "无法获取集群容量")
 		return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
 	}
 
-	// 4. 定义 D 集合 (动态计算)
-	// 对应 MATLAB: D = c_max ./ (2:5);
-	// ---------------------------------------------------------
+	if len(c) == 0 {
+		logger.Info("集群无可用 GPU 资源")
+		return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
+	}
 
-	// 第一步：找出 c_max (集群中最大的单节点空闲 GPU 数量)
+	// 4. 定义 D 集合
+	// c_max: 集群中最大的单节点空闲 GPU 数量
 	c_max := 0.0
 	for _, val := range c {
 		if val > c_max {
@@ -146,16 +142,13 @@ func (r *ConductorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	}
 
-	// 第二步：生成 D 数组 [c_max/2, c_max/3, c_max/4, c_max/5]
 	var D []float64
 	if c_max > 0 {
-		// MATLAB 的 2:5 意味着整数序列 2, 3, 4, 5
 		for i := 2; i <= 5; i++ {
 			val := c_max / float64(i)
 			D = append(D, val)
 		}
 	} else {
-		// 如果集群完全没有空闲资源 (c_max=0)，给一个默认值
 		D = []float64{1.0}
 	}
 
@@ -177,7 +170,7 @@ func (r *ConductorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			"TotalWeight", totalWeight,
 			"SelectedGroups", selectedNames,
 		)
-		// TODO: 这里仅做选择，不进行 Bind 操作
+		// TODO: Bind 操作
 	} else {
 		logger.Info("未能选中任何 PodGroup (可能资源不足或约束限制)")
 	}
@@ -186,9 +179,9 @@ func (r *ConductorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
 }
 
-// getClusterCapacities 获取集群中每个节点的空闲 GPU 数量，对应算法中的 c[]
+// getClusterCapacities 获取集群容量
 func (r *ConductorReconciler) getClusterCapacities(ctx context.Context) ([]float64, error) {
-	logger := log.FromContext(ctx) // 获取 logger
+	logger := log.FromContext(ctx)
 	gpuResourceName := corev1.ResourceName("nvidia.com/gpu")
 
 	var nodeList corev1.NodeList
@@ -221,21 +214,21 @@ func (r *ConductorReconciler) getClusterCapacities(ctx context.Context) ([]float
 		if val, ok := node.Status.Allocatable[gpuResourceName]; ok {
 			allocatable = float64(val.Value())
 		}
-
-		// 计算剩余量
 		used := nodeUsedMap[node.Name]
 		free := allocatable - used
 		if free < 0 {
 			free = 0
 		}
 
-		// 只要节点有 GPU 能力 (allocatable > 0)，就记录下来，哪怕 free 是 0
-		if allocatable > 0 {
-			logger.Info("节点 GPU 状态",
+		// [关键逻辑修正]
+		// 必须剔除空闲资源为 0 的节点。
+		// 因为 fd(0, d) = -1，会导致该节点在约束公式中产生 -1 的惩罚，
+		// 从而减少总容量的计算值，导致本来能放下的 Group 被拒绝。
+		// 使用 1e-9 过滤掉浮点数误差产生的 "假0"。
+		if free > 1e-9 {
+			logger.Info("节点加入计算池",
 				"NodeName", node.Name,
-				"Total(Allocatable)", allocatable,
-				"Used", used,
-				"Free(c_val)", free,
+				"Free", free,
 			)
 			c = append(c, free)
 		}
@@ -243,26 +236,26 @@ func (r *ConductorReconciler) getClusterCapacities(ctx context.Context) ([]float
 	return c, nil
 }
 
-// solveGroupSelectionGLPK 完全复刻你提供的 GLPK 逻辑
-// c: 容器容量数组
-// candidates: 包含了 groups, w, p 的信息
-// D: 约束参数数组
+// -------------------------------------------------------------------------
+// 核心逻辑：solveGroupSelectionGLPK
+// 1. 使用 Go Slice 传递矩阵，避免手动 malloc
+// 2. 增加 1e-6 的约束容忍度 (Constraint Tolerance)
+// 3. 设置 GLPK 整数求解参数
+// -------------------------------------------------------------------------
 func solveGroupSelectionGLPK(c []float64, candidates []CandidatePG, D []float64) ([]int, float64, float64) {
 
 	k := len(candidates) // 组的数量
 	numConstraints := len(D)
 
-	// --- 数据结构转换 ---
-	var w []float64    // 所有 items 的重量
+	// --- 数据转换 ---
+	var w []float64    // items 重量
 	var p []float64    // 组价值
-	var groups [][]int // 组 -> w 中的索引列表
+	var groups [][]int // 组成员索引
 
 	currentIndex := 0
 	for _, cand := range candidates {
 		p = append(p, cand.Priority)
-
 		var groupIndices []int
-		// 展开 PodGroup 成员
 		for i := 0; i < cand.MemberNum; i++ {
 			w = append(w, cand.PodWeight)
 			groupIndices = append(groupIndices, currentIndex)
@@ -271,129 +264,112 @@ func solveGroupSelectionGLPK(c []float64, candidates []CandidatePG, D []float64)
 		groups = append(groups, groupIndices)
 	}
 
-	// ---------------------------------------------------------
-	// 1. 初始化 GLPK 问题
-	// ---------------------------------------------------------
+	// 1. 初始化
 	lp := C.glp_create_prob()
 	defer C.glp_delete_prob(lp)
 
-	C.glp_set_prob_name(lp, C.CString("mKP_D_Solver"))
+	C.glp_set_prob_name(lp, C.CString("mKP_Fixed_Solver"))
 	C.glp_set_obj_dir(lp, C.GLP_MAX)
 
-	// ---------------------------------------------------------
-	// 2. 定义行 (约束条件)
-	// ---------------------------------------------------------
+	// 2. 定义行 (约束)
 	numRows := 1 + numConstraints
 	C.glp_add_rows(lp, C.int(numRows))
 
-	// [约束1] 重量约束 (Total Capacity)
+	// [约束1] 总容量约束 + 1e-6 容忍度
 	totalCapacity := 0.0
 	for _, val := range c {
 		totalCapacity += val
 	}
+	constraintVal1 := totalCapacity + 1e-6
 
 	C.glp_set_row_name(lp, 1, C.CString("Weight_Limit"))
-	C.glp_set_row_bnds(lp, 1, C.GLP_UP, 0.0, C.double(totalCapacity))
+	C.glp_set_row_bnds(lp, 1, C.GLP_UP, 0.0, C.double(constraintVal1))
 
-	// [约束2...N] D集合约束
+	// [约束2...N] D集合约束 + 1e-6 容忍度
 	for i, d := range D {
 		rowIdx := C.int(i + 2)
 		fTotal := 0.0
-		// 计算 sum(fd(c_j, d))
 		for _, capVal := range c {
 			fTotal += fd(capVal, d)
 		}
+		constraintValD := fTotal + 1e-6
 
 		name := C.CString(fmt.Sprintf("D_Constraint_%d", i))
 		C.glp_set_row_name(lp, rowIdx, name)
-		C.glp_set_row_bnds(lp, rowIdx, C.GLP_UP, 0.0, C.double(fTotal))
+		C.glp_set_row_bnds(lp, rowIdx, C.GLP_UP, 0.0, C.double(constraintValD))
+		C.free(unsafe.Pointer(name))
 	}
 
-	// ---------------------------------------------------------
-	// 3. 定义列 (决策变量 z_i)
-	// ---------------------------------------------------------
+	// 3. 定义列 (决策变量)
 	C.glp_add_cols(lp, C.int(k))
 	for i := 0; i < k; i++ {
 		colIdx := C.int(i + 1)
 		name := C.CString(fmt.Sprintf("z_%d", i))
-
 		C.glp_set_col_name(lp, colIdx, name)
-		C.glp_set_col_kind(lp, colIdx, C.GLP_BV) // Binary
+		C.glp_set_col_kind(lp, colIdx, C.GLP_BV) // Binary Variable
 		C.glp_set_obj_coef(lp, colIdx, C.double(p[i]))
+		C.free(unsafe.Pointer(name))
 	}
 
-	// ---------------------------------------------------------
-	// 4. 构建稀疏矩阵 (Matrix)
-	// ---------------------------------------------------------
-	// 计算矩阵最大元素个数
-	maxElements := k*numRows + 1
+	// 4. 构建稀疏矩阵
+	// GLPK 使用 1-based 索引，idx 0 为占位
+	ia := []int32{0}
+	ja := []int32{0}
+	ar := []float64{0.0}
 
-	c_ia := (*C.int)(C.malloc(C.size_t(maxElements * 4)))
-	c_ja := (*C.int)(C.malloc(C.size_t(maxElements * 4)))
-	c_ar := (*C.double)(C.malloc(C.size_t(maxElements * 8)))
-	defer C.free(unsafe.Pointer(c_ia))
-	defer C.free(unsafe.Pointer(c_ja))
-	defer C.free(unsafe.Pointer(c_ar))
-
-	ia := (*[1 << 30]C.int)(unsafe.Pointer(c_ia))[:maxElements:maxElements]
-	ja := (*[1 << 30]C.int)(unsafe.Pointer(c_ja))[:maxElements:maxElements]
-	ar := (*[1 << 30]C.double)(unsafe.Pointer(c_ar))[:maxElements:maxElements]
-
-	idx := 1
-
-	// 填充矩阵：重量约束行 (Row 1)
+	// Row 1: 重量约束系数
 	for i := 0; i < k; i++ {
 		gw := 0.0
 		for _, itemIdx := range groups[i] {
 			gw += w[itemIdx]
 		}
 		if gw != 0 {
-			ia[idx] = 1
-			ja[idx] = C.int(i + 1)
-			ar[idx] = C.double(gw)
-			idx++
+			ia = append(ia, 1)
+			ja = append(ja, int32(i+1))
+			ar = append(ar, gw)
 		}
 	}
 
-	// 填充矩阵：D集合约束行 (Row 2...N)
+	// Row 2...N: D约束系数
 	for dIdx, d := range D {
-		rowIdx := C.int(dIdx + 2)
+		rowIdx := int32(dIdx + 2)
 		for i := 0; i < k; i++ {
 			val := 0.0
 			for _, itemIdx := range groups[i] {
-				// 这里的 w[itemIdx] 是单个 Pod 的重量
-				// 你的逻辑核心：对每个 item 应用 fd 然后求和
-				val += fd(w[itemIdx], d)
+				val += fd(w[itemIdx], d) // 使用修正后的 fd
 			}
-
-			// 即使 val 是 0 也添加，保持逻辑结构一致（稀疏矩阵其实可以优化跳过）
-			ia[idx] = rowIdx
-			ja[idx] = C.int(i + 1)
-			ar[idx] = C.double(val)
-			idx++
+			// 优化：只有当 val 不为 0 时才加入矩阵
+			if math.Abs(val) > 1e-9 {
+				ia = append(ia, rowIdx)
+				ja = append(ja, int32(i+1))
+				ar = append(ar, val)
+			}
 		}
 	}
 
 	// 加载矩阵
-	C.set_matrix(lp, C.int(idx-1), c_ia, c_ja, c_ar)
+	ne := C.int(len(ia) - 1)
+	C.glp_load_matrix(lp, ne,
+		(*C.int)(unsafe.Pointer(&ia[0])),
+		(*C.int)(unsafe.Pointer(&ja[0])),
+		(*C.double)(unsafe.Pointer(&ar[0])))
 
-	// ---------------------------------------------------------
-	// 5. 求解
-	// ---------------------------------------------------------
+	// 5. 求解参数设置
 	var iocp C.glp_iocp
 	C.glp_init_iocp(&iocp)
 	iocp.presolve = C.GLP_ON
-	iocp.msg_lev = C.GLP_MSG_OFF // 关闭日志
+	iocp.msg_lev = C.GLP_MSG_OFF
+	// [关键修正] 设置整数求解器的公差
+	iocp.tol_int = 1e-6
+	iocp.tol_obj = 1e-6
 
 	err := C.glp_intopt(lp, &iocp)
 	if err != 0 {
-		fmt.Printf("求解出错: %d\n", err)
+		fmt.Printf("GLPK 求解错误代码: %d\n", err)
 		return nil, 0, 0
 	}
 
-	// ---------------------------------------------------------
-	// 6. 输出结果
-	// ---------------------------------------------------------
+	// 6. 结果提取
 	status := C.glp_mip_status(lp)
 	if status == C.GLP_OPT {
 		totalVal := float64(C.glp_mip_obj_val(lp))
@@ -404,7 +380,6 @@ func solveGroupSelectionGLPK(c []float64, candidates []CandidatePG, D []float64)
 			val := C.glp_mip_col_val(lp, C.int(i+1))
 			if val > 0.5 {
 				selectedIndices = append(selectedIndices, i)
-				// 计算实际重量
 				for _, itemIdx := range groups[i] {
 					totalWeight += w[itemIdx]
 				}
